@@ -31,7 +31,7 @@ async function checkRelayReachable(port) {
   } catch {
     setStatus(
       'error',
-      `Relay not reachable at ${url}. Start OpenClaw’s browser relay on this machine, then click the toolbar button again.`,
+      `Relay not reachable at ${url}. Start OpenClaw's browser relay on this machine, then click the toolbar button again.`,
     )
   } finally {
     clearTimeout(t)
@@ -39,14 +39,30 @@ async function checkRelayReachable(port) {
 }
 
 async function load() {
-  const stored = await chrome.storage.local.get(['relayPort'])
+  const stored = await chrome.storage.local.get([
+    'relayPort',
+    'profileId',
+    'profileName',
+    'autoConnect',
+    'autoAttach',
+  ])
+
+  // Relay port
   const port = clampPort(stored.relayPort)
   document.getElementById('port').value = String(port)
   updateRelayUrl(port)
   await checkRelayReachable(port)
+
+  // Profile
+  document.getElementById('profileId').textContent = stored.profileId || '(not yet generated)'
+  document.getElementById('profileName').value = stored.profileName || ''
+
+  // Automation
+  document.getElementById('autoConnect').checked = stored.autoConnect === true
+  document.getElementById('autoAttach').checked = stored.autoAttach === true
 }
 
-async function save() {
+async function savePort() {
   const input = document.getElementById('port')
   const port = clampPort(input.value)
   await chrome.storage.local.set({ relayPort: port })
@@ -55,5 +71,23 @@ async function save() {
   await checkRelayReachable(port)
 }
 
-document.getElementById('save').addEventListener('click', () => void save())
+async function saveProfile() {
+  const name = document.getElementById('profileName').value.trim()
+  await chrome.storage.local.set({ profileName: name })
+}
+
+async function saveAutoConnect() {
+  const checked = document.getElementById('autoConnect').checked
+  await chrome.storage.local.set({ autoConnect: checked })
+}
+
+async function saveAutoAttach() {
+  const checked = document.getElementById('autoAttach').checked
+  await chrome.storage.local.set({ autoAttach: checked })
+}
+
+document.getElementById('save').addEventListener('click', () => void savePort())
+document.getElementById('saveProfile').addEventListener('click', () => void saveProfile())
+document.getElementById('autoConnect').addEventListener('change', () => void saveAutoConnect())
+document.getElementById('autoAttach').addEventListener('change', () => void saveAutoAttach())
 void load()

@@ -441,6 +441,15 @@ async function findPageByTargetId(
               }
             }
           }
+          // Index-based fallback: if target count matches page count, use position
+          // This handles post-navigation cases where URLs in /json/list are stale
+          // but the relay and Playwright enumerate tabs in the same order
+          if (targets.length === pages.length) {
+            const idx = targets.findIndex((t) => t.id === targetId);
+            if (idx >= 0 && idx < pages.length) {
+              return pages[idx];
+            }
+          }
         }
       }
     } catch {
@@ -454,26 +463,41 @@ export async function getPageForTargetId(opts: {
   cdpUrl: string;
   targetId?: string;
 }): Promise<Page> {
-  const { browser } = await connectBrowser(opts.cdpUrl);
-  const pages = await getAllPages(browser);
-  if (!pages.length) {
-    throw new Error("No pages available in the connected browser.");
-  }
-  const first = pages[0];
-  if (!opts.targetId) {
-    return first;
-  }
-  const found = await findPageByTargetId(browser, opts.targetId, opts.cdpUrl);
-  if (!found) {
-    // Extension relays can block CDP attachment APIs (e.g. Target.attachToBrowserTarget),
-    // which prevents us from resolving a page's targetId via newCDPSession(). If Playwright
-    // only exposes a single Page, use it as a best-effort fallback.
-    if (pages.length === 1) {
+  const attempt = async (): Promise<Page> => {
+    const { browser } = await connectBrowser(opts.cdpUrl);
+    const pages = await getAllPages(browser);
+    if (!pages.length) {
+      throw new Error("No pages available in the connected browser.");
+    }
+    const first = pages[0];
+    if (!opts.targetId) {
       return first;
     }
-    throw new Error("tab not found");
+    const found = await findPageByTargetId(browser, opts.targetId, opts.cdpUrl);
+    if (!found) {
+      // Extension relays can block CDP attachment APIs (e.g. Target.attachToBrowserTarget),
+      // which prevents us from resolving a page's targetId via newCDPSession(). If Playwright
+      // only exposes a single Page, use it as a best-effort fallback.
+      if (pages.length === 1) {
+        return first;
+      }
+      throw new Error("tab not found");
+    }
+    return found;
+  };
+
+  try {
+    return await attempt();
+  } catch (err) {
+    if (err instanceof Error && err.message === "tab not found") {
+      // Reconnect: the Playwright CDP connection may be stale (e.g. after navigation
+      // via extension relay). Drop the cached browser and retry once.
+      cached = null;
+      await new Promise((r) => setTimeout(r, 300));
+      return await attempt();
+    }
+    throw err;
   }
-  return found;
 }
 
 export function refLocator(page: Page, ref: string) {

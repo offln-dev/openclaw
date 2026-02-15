@@ -1,8 +1,11 @@
 import type { IncomingMessage } from "node:http";
 import type { AddressInfo } from "node:net";
 import type { Duplex } from "node:stream";
+import { execFileSync } from "node:child_process";
 import { randomBytes } from "node:crypto";
+import { copyFileSync, existsSync, readFileSync, readdirSync } from "node:fs";
 import { createServer } from "node:http";
+import { join, dirname } from "node:path";
 import WebSocket, { WebSocketServer } from "ws";
 import { isLoopbackAddress, isLoopbackHost } from "../gateway/net.js";
 import { rawDataToString } from "../infra/ws.js";
@@ -188,6 +191,7 @@ export async function ensureChromeExtensionRelayServer(opts: {
   }
 
   let extensionWs: WebSocket | null = null;
+  let extensionProfile: { profileId?: string; profileName?: string } | null = null;
   const cdpClients = new Set<WebSocket>();
   const connectedTargets = new Map<string, ConnectedTarget>();
 
@@ -200,6 +204,31 @@ export async function ensureChromeExtensionRelayServer(opts: {
     }
   >();
   let nextExtensionId = 1;
+
+  // ── Session aliasing ──────────────────────────────────────────────
+  // When the extension reattaches the same tab (same targetId) with a
+  // new Chrome-assigned sessionId, we keep the *original* sessionId
+  // that Playwright already knows about.  All CDP traffic is silently
+  // translated:
+  //   Playwright → relay:  old sessionId → new real sessionId (to extension)
+  //   Extension  → relay:  new real sessionId → old sessionId (to Playwright)
+  //
+  // playwrightToReal: sessionId Playwright uses → actual Chrome sessionId
+  // realToPlaywright: actual Chrome sessionId   → sessionId Playwright uses
+  const playwrightToReal = new Map<string, string>();
+  const realToPlaywright = new Map<string, string>();
+
+  /** Translate a sessionId from Playwright's view to the real Chrome sessionId */
+  const toRealSession = (sid?: string): string | undefined => {
+    if (!sid) return sid;
+    return playwrightToReal.get(sid) ?? sid;
+  };
+
+  /** Translate a sessionId from Chrome/extension back to Playwright's view */
+  const toPlaywrightSession = (sid?: string): string | undefined => {
+    if (!sid) return sid;
+    return realToPlaywright.get(sid) ?? sid;
+  };
 
   const sendToExtension = async (payload: ExtensionForwardCommandMessage): Promise<unknown> => {
     const ws = extensionWs;
@@ -311,6 +340,13 @@ export async function ensureChromeExtensionRelayServer(opts: {
         }
         throw new Error("target not found");
       }
+      case "Target.attachToBrowserTarget": {
+        // Playwright calls this internally for newCDPSession(page).
+        // Return the first available session — the extension relay is the "browser".
+        const first = Array.from(connectedTargets.values())[0];
+        if (first) return { sessionId: first.sessionId };
+        throw new Error("No browser target available — no tabs attached to extension");
+      }
       default: {
         const id = nextExtensionId++;
         return await sendToExtension({
@@ -318,7 +354,8 @@ export async function ensureChromeExtensionRelayServer(opts: {
           method: "forwardCDPCommand",
           params: {
             method: cmd.method,
-            sessionId: cmd.sessionId,
+            // Translate Playwright's sessionId to the real Chrome sessionId
+            sessionId: toRealSession(cmd.sessionId),
             params: cmd.params,
           },
         });
@@ -356,6 +393,131 @@ export async function ensureChromeExtensionRelayServer(opts: {
     if (path === "/extension/status") {
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ connected: Boolean(extensionWs) }));
+      return;
+    }
+
+    if (path === "/extension/reload" && req.method === "POST") {
+      if (!extensionWs || extensionWs.readyState !== 1) {
+        res.writeHead(503, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ ok: false, error: "extension not connected" }));
+        return;
+      }
+
+      // Find background.js and validate syntax before reloading.
+      // Search: env override → Chrome profile unpacked extensions → container default
+      const extDir = process.env.OPENCLAW_EXTENSION_DIR?.trim() || "";
+      const candidatePaths = [extDir ? join(extDir, "background.js") : ""];
+      // Discover unpacked extension paths from Chrome Default profile preferences
+      try {
+        const homes = [
+          process.env.HOME || "/home/node",
+          ...(() => {
+            try {
+              return readdirSync("/home")
+                .map((d) => join("/home", d))
+                .filter((d) => d !== (process.env.HOME || "/home/node"));
+            } catch {
+              return [];
+            }
+          })(),
+        ];
+        const prefsPath =
+          homes
+            .map((h) => join(h, ".config/google-chrome/Default/Preferences"))
+            .find((p) => existsSync(p)) ??
+          join(process.env.HOME || "/home/node", ".config/google-chrome/Default/Preferences");
+        if (existsSync(prefsPath)) {
+          const prefs = JSON.parse(readFileSync(prefsPath, "utf-8")) as {
+            extensions?: {
+              settings?: Record<string, { path?: string; manifest?: { name?: string } }>;
+            };
+          };
+          const exts = prefs?.extensions?.settings ?? {};
+          for (const ext of Object.values(exts)) {
+            const p = ext?.path ?? "";
+            const name = ext?.manifest?.name ?? "";
+            if (
+              (p.includes("openclaw") ||
+                name.toLowerCase().includes("openclaw") ||
+                name.toLowerCase().includes("browser relay")) &&
+              existsSync(join(p, "background.js"))
+            ) {
+              candidatePaths.push(join(p, "background.js"));
+            }
+          }
+        }
+      } catch {
+        // Chrome prefs not available, skip
+      }
+      candidatePaths.push("/app/assets/chrome-extension/background.js");
+      const filteredPaths = candidatePaths.filter(Boolean);
+
+      const bgPath = filteredPaths.find((p) => existsSync(p));
+      if (bgPath) {
+        // Validate JS syntax before reload
+        try {
+          execFileSync(process.execPath, ["--check", bgPath], {
+            timeout: 5_000,
+            stdio: "pipe",
+          });
+        } catch (syntaxErr) {
+          const msg = syntaxErr instanceof Error ? syntaxErr.message : String(syntaxErr);
+          res.writeHead(400, { "Content-Type": "application/json" });
+          res.end(
+            JSON.stringify({
+              ok: false,
+              error: `background.js syntax error — reload aborted`,
+              details: msg.slice(0, 500),
+              path: bgPath,
+            }),
+          );
+          return;
+        }
+        // Backup to .last-good before reload
+        const lastGood = join(dirname(bgPath), "background.last-good.js");
+        try {
+          copyFileSync(bgPath, lastGood);
+        } catch {
+          // non-fatal: best-effort backup
+        }
+      }
+
+      try {
+        const wasConnected = Boolean(extensionWs);
+        extensionWs.send(JSON.stringify({ method: "reload" }));
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(
+          JSON.stringify({ ok: true, validated: Boolean(bgPath), backed_up: Boolean(bgPath) }),
+        );
+
+        // Monitor reconnection: if extension doesn't reconnect within 30s,
+        // log a warning (can't auto-restore without manual intervention)
+        if (wasConnected && bgPath) {
+          const lastGood = join(dirname(bgPath), "background.last-good.js");
+          setTimeout(() => {
+            if (!extensionWs || extensionWs.readyState !== 1) {
+              // Extension didn't reconnect — restore backup
+              if (existsSync(lastGood)) {
+                try {
+                  copyFileSync(lastGood, bgPath);
+                  console.warn(
+                    `[extension-relay] Extension failed to reconnect after reload. ` +
+                      `Restored ${bgPath} from .last-good. ` +
+                      `Manual reload in chrome://extensions may be needed.`,
+                  );
+                } catch {
+                  console.warn(
+                    `[extension-relay] Extension failed to reconnect and backup restore failed.`,
+                  );
+                }
+              }
+            }
+          }, 30_000);
+        }
+      } catch (err) {
+        res.writeHead(500, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ ok: false, error: String(err) }));
+      }
       return;
     }
 
@@ -441,6 +603,58 @@ export async function ensureChromeExtensionRelayServer(opts: {
       })();
       res.writeHead(200);
       res.end("OK");
+      return;
+    }
+
+    // /json/new?url=ENCODED_URL — create a new tab via extension
+    if (
+      (path === "/json/new" || path === "/json/new/") &&
+      (req.method === "GET" || req.method === "PUT")
+    ) {
+      const targetUrl = url.searchParams.get("url") || "about:blank";
+      if (!extensionWs || extensionWs.readyState !== WebSocket.OPEN) {
+        res.writeHead(503, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "Extension not connected" }));
+        return;
+      }
+      void (async () => {
+        try {
+          const result = (await sendToExtension({
+            id: nextExtensionId++,
+            method: "forwardCDPCommand",
+            params: { method: "Target.createTarget", params: { url: targetUrl } },
+          })) as { targetId?: string } | undefined;
+          const targetId = result?.targetId ?? "";
+          // Look up the target in connectedTargets (extension auto-attaches)
+          // Give it a moment for the attachedToTarget event to arrive
+          let target: ConnectedTarget | undefined;
+          for (let i = 0; i < 10 && !target; i++) {
+            for (const t of connectedTargets.values()) {
+              if (t.targetId === targetId) {
+                target = t;
+                break;
+              }
+            }
+            if (!target) await new Promise((r) => setTimeout(r, 200));
+          }
+          const payload = {
+            id: targetId,
+            type: target?.targetInfo?.type ?? "page",
+            title: target?.targetInfo?.title ?? "",
+            url: target?.targetInfo?.url ?? targetUrl,
+            webSocketDebuggerUrl: cdpWsUrl,
+          };
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify(payload));
+        } catch (err) {
+          res.writeHead(500, { "Content-Type": "application/json" });
+          res.end(
+            JSON.stringify({
+              error: err instanceof Error ? err.message : String(err),
+            }),
+          );
+        }
+      })();
       return;
     }
 
@@ -534,6 +748,20 @@ export async function ensureChromeExtensionRelayServer(opts: {
         if ((parsed as ExtensionPongMessage).method === "pong") {
           return;
         }
+
+        // Handle profile registration from extension
+        if ((parsed as { method: string }).method === "register") {
+          const regParams = (parsed as { params?: { profileId?: string; profileName?: string } })
+            .params;
+          if (regParams) {
+            extensionProfile = {
+              profileId: regParams.profileId,
+              profileName: regParams.profileName,
+            };
+          }
+          return;
+        }
+
         if ((parsed as ExtensionForwardEventMessage).method !== "forwardCDPEvent") {
           return;
         }
@@ -552,20 +780,56 @@ export async function ensureChromeExtensionRelayServer(opts: {
             return;
           }
           if (attached?.sessionId && attached?.targetInfo?.targetId) {
-            const prev = connectedTargets.get(attached.sessionId);
+            const newRealSid = attached.sessionId;
             const nextTargetId = attached.targetInfo.targetId;
+
+            // ── Session-aliasing for same-tab reattach ──────────────────
+            // If this targetId is already tracked under a different session,
+            // the tab was reattached (e.g. transient detach/reattach by the
+            // extension).  Instead of tearing down and recreating the
+            // Playwright CRPage, silently remap: Playwright keeps using the
+            // old sessionId, we translate to/from the new real one.
+            let existingPlaywrightSid: string | null = null;
+            for (const [sid, target] of connectedTargets) {
+              if (target.targetId === nextTargetId && sid !== newRealSid) {
+                existingPlaywrightSid = sid;
+                break;
+              }
+            }
+
+            if (existingPlaywrightSid) {
+              // Same tab, new Chrome sessionId → alias it
+              // Clean up any old alias for this playwright session
+              const oldReal = playwrightToReal.get(existingPlaywrightSid);
+              if (oldReal) realToPlaywright.delete(oldReal);
+
+              playwrightToReal.set(existingPlaywrightSid, newRealSid);
+              realToPlaywright.set(newRealSid, existingPlaywrightSid);
+
+              // Update connectedTargets to keep using the playwright sessionId
+              connectedTargets.set(existingPlaywrightSid, {
+                sessionId: existingPlaywrightSid,
+                targetId: nextTargetId,
+                targetInfo: attached.targetInfo,
+              });
+              // Don't broadcast anything — Playwright doesn't need to know
+              return;
+            }
+            // ── End session-aliasing ────────────────────────────────────
+
+            const prev = connectedTargets.get(newRealSid);
             const prevTargetId = prev?.targetId;
             const changedTarget = Boolean(prev && prevTargetId && prevTargetId !== nextTargetId);
-            connectedTargets.set(attached.sessionId, {
-              sessionId: attached.sessionId,
+            connectedTargets.set(newRealSid, {
+              sessionId: newRealSid,
               targetId: nextTargetId,
               targetInfo: attached.targetInfo,
             });
             if (changedTarget && prevTargetId) {
               broadcastToCdpClients({
                 method: "Target.detachedFromTarget",
-                params: { sessionId: attached.sessionId, targetId: prevTargetId },
-                sessionId: attached.sessionId,
+                params: { sessionId: newRealSid, targetId: prevTargetId },
+                sessionId: newRealSid,
               });
             }
             if (!prev || changedTarget) {
@@ -577,10 +841,27 @@ export async function ensureChromeExtensionRelayServer(opts: {
 
         if (method === "Target.detachedFromTarget") {
           const detached = (params ?? {}) as DetachedFromTargetEvent;
-          if (detached?.sessionId) {
-            connectedTargets.delete(detached.sessionId);
+          const realSid = detached?.sessionId;
+          if (realSid) {
+            // Check if this real sessionId is aliased
+            const pwSid = realToPlaywright.get(realSid);
+            if (pwSid) {
+              // Clean up aliases and use playwright's sessionId
+              realToPlaywright.delete(realSid);
+              playwrightToReal.delete(pwSid);
+              connectedTargets.delete(pwSid);
+              broadcastToCdpClients({
+                method,
+                params: { ...detached, sessionId: pwSid },
+                sessionId: pwSid,
+              });
+            } else {
+              connectedTargets.delete(realSid);
+              broadcastToCdpClients({ method, params, sessionId });
+            }
+          } else {
+            broadcastToCdpClients({ method, params, sessionId });
           }
-          broadcastToCdpClients({ method, params, sessionId });
           return;
         }
 
@@ -603,19 +884,24 @@ export async function ensureChromeExtensionRelayServer(opts: {
           }
         }
 
-        broadcastToCdpClients({ method, params, sessionId });
+        // Translate real Chrome sessionId → Playwright's sessionId for events
+        const pwSessionId = toPlaywrightSession(sessionId);
+        broadcastToCdpClients({ method, params, sessionId: pwSessionId });
       }
     });
 
     ws.on("close", () => {
       clearInterval(ping);
       extensionWs = null;
+      extensionProfile = null;
       for (const [, pending] of pendingExtension) {
         clearTimeout(pending.timer);
         pending.reject(new Error("extension disconnected"));
       }
       pendingExtension.clear();
       connectedTargets.clear();
+      playwrightToReal.clear();
+      realToPlaywright.clear();
 
       for (const client of cdpClients) {
         try {
@@ -723,6 +1009,8 @@ export async function ensureChromeExtensionRelayServer(opts: {
       serversByPort.delete(port);
       relayAuthByPort.delete(port);
       try {
+        // Tell extension not to reconnect — this is a planned shutdown
+        extensionWs?.send(JSON.stringify({ method: "shutdown" }));
         extensionWs?.close(1001, "server stopping");
       } catch {
         // ignore

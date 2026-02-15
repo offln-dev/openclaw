@@ -95,6 +95,19 @@
         color: var(--muted);
         margin-bottom: 6px;
       }
+      label.inline {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        margin-bottom: 0;
+        font-size: 13px;
+        color: canvasText;
+        cursor: pointer;
+      }
+      label.inline input[type="checkbox"] {
+        width: auto;
+        accent-color: var(--accent);
+      }
       input {
         width: 160px;
         padding: 10px 12px;
@@ -187,6 +200,35 @@
             Only change this if your OpenClaw profile uses a different <code>cdpUrl</code> port.
           </div>
           <div class="status" id="status"></div>
+        </div>
+
+        <div class="card">
+          <h2>Profile</h2>
+          <label for="profileName">Display name (optional)</label>
+          <div class="row">
+            <input id="profileName" type="text" placeholder="e.g. Work, Personal" />
+            <button id="saveProfile" type="button">Save</button>
+          </div>
+          <div class="hint">
+            Helps identify this Chrome profile when multiple browsers connect to the same relay.
+            Profile ID: <code id="profileId">—</code>
+          </div>
+        </div>
+
+        <div class="card">
+          <h2>Automation</h2>
+          <label class="inline">
+            <input type="checkbox" id="autoConnect" />
+            Auto-connect to relay on startup
+          </label>
+          <label class="inline" style="margin-top: 8px;">
+            <input type="checkbox" id="autoAttach" />
+            Auto-attach all tabs when connected
+          </label>
+          <div class="hint">
+            By default, the extension waits for you to click the toolbar button.
+            Enable these for a dedicated OpenClaw-managed browser that auto-attaches everything.
+          </div>
         </div>
       </div>
 

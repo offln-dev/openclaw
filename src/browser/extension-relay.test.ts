@@ -366,4 +366,71 @@ describe("chrome extension relay server", () => {
     cdp.close();
     ext.close();
   });
+
+  it("aliases session when same targetId reattaches with a new sessionId", async () => {
+    const port = await getFreePort();
+    cdpUrl = `http://127.0.0.1:${port}`;
+    await ensureChromeExtensionRelayServer({ cdpUrl });
+
+    const ext = new WebSocket(`ws://127.0.0.1:${port}/extension`);
+    await waitForOpen(ext);
+
+    const cdp = new WebSocket(`ws://127.0.0.1:${port}/cdp`, {
+      headers: relayAuthHeaders(`ws://127.0.0.1:${port}/cdp`),
+    });
+    await waitForOpen(cdp);
+    const q = createMessageQueue(cdp);
+
+    // First attach: session "s1" for target "t1"
+    ext.send(
+      JSON.stringify({
+        method: "forwardCDPEvent",
+        params: {
+          method: "Target.attachedToTarget",
+          params: {
+            sessionId: "s1",
+            targetInfo: { targetId: "t1", type: "page", title: "Tab", url: "https://example.com" },
+            waitingForDebugger: false,
+          },
+        },
+      }),
+    );
+    const first = JSON.parse(await q.next()) as { method?: string; params?: unknown };
+    expect(first.method).toBe("Target.attachedToTarget");
+
+    // Same targetId reattaches with a new sessionId "s2"
+    // Session aliasing should suppress this — Playwright keeps using "s1"
+    ext.send(
+      JSON.stringify({
+        method: "forwardCDPEvent",
+        params: {
+          method: "Target.attachedToTarget",
+          params: {
+            sessionId: "s2",
+            targetInfo: { targetId: "t1", type: "page", title: "Tab", url: "https://example.com" },
+            waitingForDebugger: false,
+          },
+        },
+      }),
+    );
+
+    // Send a regular event with the new real sessionId "s2" — should be
+    // translated back to "s1" for Playwright
+    ext.send(
+      JSON.stringify({
+        method: "forwardCDPEvent",
+        params: {
+          sessionId: "s2",
+          method: "Page.loadEventFired",
+          params: { timestamp: 123 },
+        },
+      }),
+    );
+    const loadEvt = JSON.parse(await q.next()) as { method?: string; sessionId?: string };
+    expect(loadEvt.method).toBe("Page.loadEventFired");
+    expect(loadEvt.sessionId).toBe("s1"); // translated back to original
+
+    cdp.close();
+    ext.close();
+  });
 });
